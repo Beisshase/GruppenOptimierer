@@ -547,7 +547,7 @@ for gi in range(n_gruppen):
 # Karte
 # ----------------------------------------------------------------------
 if "zeige_karte" not in st.session_state:
-    st.session_state.zeige_karte = False
+    st.session_state.zeige_karte = True
 karte_label = "Karte ausblenden" if st.session_state.zeige_karte else "Gruppen auf Karte anzeigen"
 if st.button(karte_label, key="karte_toggle"):
     st.session_state.zeige_karte = not st.session_state.zeige_karte
