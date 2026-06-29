@@ -12,6 +12,10 @@ Es gibt zwei Varianten mit derselben Kernlogik:
   - app.py: interaktive Streamlit-Website (Excel hochladen, Gruppen
             per Drag & Drop anpassen, Kartenansicht, Download)
 
+Website (online)
+------------------
+https://gruppenoptimierer-kynso.streamlit.app/
+
 Installation
 -------------
 py -3.12 -m pip install -r requirements.txt
