@@ -75,3 +75,7 @@ Kommandozeile:
 
 Website (lokal):
   py -3.12 -m streamlit run app.py
+
+Copyright
+---------
+(c) 2026 by Kynso GmbH
