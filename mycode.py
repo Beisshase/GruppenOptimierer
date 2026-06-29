@@ -6,13 +6,14 @@ import openpyxl
 import requests
 
 EXCEL_IN  = "Meldelisten-mit-Sportstätten_A1.xlsx"
-EXCEL_OUT = "Abstandsmatrix.xlsx"
+_basis, _ext = os.path.splitext(EXCEL_IN)
+EXCEL_OUT = f"{_basis}-Gruppeneinteilung{_ext}"
 SHEET     = "AZ"
 N_GRUPPEN = 4          # <- hier später variieren
 SEED      = 42
 
 # ----------------------------------------------------------------------
-# 1) Excel einlesen: Spalte A = V.Nr., Spalte L = Adresse
+# 1) Excel einlesen: Spalte A = V.Nr., Spalte B = Vereinsname, Spalte L = Adresse
 # ----------------------------------------------------------------------
 wb = openpyxl.load_workbook(EXCEL_IN, data_only=True)
 ws = wb[SHEET]
@@ -20,15 +21,18 @@ ws = wb[SHEET]
 vereine = []
 for row in ws.iter_rows(min_row=2, values_only=True):
     vnr = row[0]
+    name = row[1]
     adr = row[11]
     if vnr is None:
         continue
+    name = str(name).strip() if name else ""
     adr = str(adr).strip() if adr else ""
-    vereine.append((str(vnr), adr))
+    vereine.append((str(vnr), name, adr))
 
 print(f"{len(vereine)} Vereine eingelesen.")
 
-labels = [vnr for vnr, _ in vereine]
+labels = [vnr for vnr, _, _ in vereine]
+namen = [name for _, name, _ in vereine]
 N = len(vereine)
 
 # ----------------------------------------------------------------------
@@ -96,13 +100,13 @@ if os.path.exists(EXCEL_OUT):
         )
     matrix = [[cache_sh.cell(row=2 + i, column=2 + j).value for j in range(N)] for i in range(N)]
     valid = [any(v is not None for v in matrix[i]) for i in range(N)]
-    for (vnr, adr), ok in zip(vereine, valid):
+    for (vnr, _, adr), ok in zip(vereine, valid):
         if not ok:
             nicht_gefunden.append((vnr, adr if adr else "(keine Adresse)"))
 else:
     print(f"\n{EXCEL_OUT} noch nicht vorhanden -> Matrix wird neu berechnet (Geocoding + OSRM).")
     coords = []
-    for vnr, adr in vereine:
+    for vnr, _, adr in vereine:
         if not adr:
             coords.append(None)
             nicht_gefunden.append((vnr, "(keine Adresse)"))
@@ -231,9 +235,9 @@ for gi, grp in enumerate(beste, 1):
     avg_paar = summe / paare if paare else 0.0
     avg_verein = summe / n if n else 0.0
     print(f"Gruppe {gi} ({n} Vereine, Distanzsumme {summe:.1f} km, Schnitt/Paar {avg_paar:.1f} km, Schnitt/Verein {avg_verein:.1f} km):")
-    print("   " + ", ".join(labels[i] for i in grp))
+    print("   " + ", ".join(f"{labels[i]} ({namen[i]})" for i in grp))
 
-ohne = [labels[i] for i in range(N) if not valid[i]]
+ohne = [f"{labels[i]} ({namen[i]})" for i in range(N) if not valid[i]]
 if ohne:
     print(f"\nNicht zugeordnet (keine Koordinate): {', '.join(ohne)}")
 
@@ -241,28 +245,30 @@ if ohne:
 sh2 = out.create_sheet("Gruppen")
 sh2.cell(row=1, column=1, value="Gruppe")
 sh2.cell(row=1, column=2, value="V.Nr.")
+sh2.cell(row=1, column=3, value="Vereinsname")
 z = 2
 for gi, grp in enumerate(beste, 1):
     for i in grp:
         sh2.cell(row=z, column=1, value=gi)
         sh2.cell(row=z, column=2, value=labels[i])
+        sh2.cell(row=z, column=3, value=namen[i])
         z += 1
 
 # Abstandssummen je Gruppe (Übersicht rechts daneben)
-sh2.cell(row=1, column=4, value="Gruppe")
-sh2.cell(row=1, column=5, value="Anzahl Vereine")
-sh2.cell(row=1, column=6, value="Distanzsumme (km)")
-sh2.cell(row=1, column=7, value="Ø je Vereinspaar (km)")
-sh2.cell(row=1, column=8, value="Ø je Verein (km)")
+sh2.cell(row=1, column=5, value="Gruppe")
+sh2.cell(row=1, column=6, value="Anzahl Vereine")
+sh2.cell(row=1, column=7, value="Distanzsumme (km)")
+sh2.cell(row=1, column=8, value="Ø je Vereinspaar (km)")
+sh2.cell(row=1, column=9, value="Ø je Verein (km)")
 for gi, grp in enumerate(beste, 1):
     n = len(grp)
     summe = gruppen_kosten(grp)
     paare = n * (n - 1) / 2
-    sh2.cell(row=1 + gi, column=4, value=gi)
-    sh2.cell(row=1 + gi, column=5, value=n)
-    sh2.cell(row=1 + gi, column=6, value=round(summe, 1))
-    sh2.cell(row=1 + gi, column=7, value=round(summe / paare, 1) if paare else 0)
-    sh2.cell(row=1 + gi, column=8, value=round(summe / n, 1) if n else 0)
+    sh2.cell(row=1 + gi, column=5, value=gi)
+    sh2.cell(row=1 + gi, column=6, value=n)
+    sh2.cell(row=1 + gi, column=7, value=round(summe, 1))
+    sh2.cell(row=1 + gi, column=8, value=round(summe / paare, 1) if paare else 0)
+    sh2.cell(row=1 + gi, column=9, value=round(summe / n, 1) if n else 0)
 
 for versuch in range(5):
     try:
