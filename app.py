@@ -1,12 +1,15 @@
 import io
+import math
 import os
 import random
 import re
 import time
 
 import openpyxl
+import pydeck as pdk
 import requests
 import streamlit as st
+from openlocationcode import openlocationcode as olc
 from streamlit_sortables import sort_items
 
 st.set_page_config(page_title="GruppenOptimierer", layout="wide")
@@ -19,53 +22,126 @@ st.write(
 
 
 # ----------------------------------------------------------------------
-# Kernlogik (identisch zu mycode.py)
+# Kernlogik (identisch zu mycode.py): Adresse besteht aus "Straße, PLZ Ort"
+# oder "Pluscode, PLZ Ort"
 # ----------------------------------------------------------------------
-def clean_address(adresse):
+PLUSCODE_REGEX = re.compile(r"\b[23456789CFGHJMPQRVWXcfghjmpqrvwx]{2,8}\+[23456789CFGHJMPQRVWXcfghjmpqrvwx]{0,3}\b")
+
+
+def parse_adresse(adresse):
+    # Adresse ist bereinigt auf "Strasse/Platzname, PLZ Ort" bzw. "Pluscode,
+    # PLZ Ort" - die Strasse muss daher kein bestimmtes Wort (Weg/Strasse/...)
+    # enthalten, sie ist einfach das Segment, das weder PLZ/Ort noch Pluscode ist.
     s = adresse.replace("  ", " ").strip()
-    teile = [t.strip() for t in s.split(",")]
-    strasse = None
-    for t in teile:
-        if re.search(r"(str\.?|straße|strasse|weg|gasse|ring|allee|wiese)", t, re.I) \
-           and not re.search(r"rasenplatz|kunstrasen|hartplatz|stadion", t, re.I):
-            strasse = t
-            break
+    teile = [t.strip() for t in s.split(",") if t.strip()]
+
     plz_ort = None
-    for t in teile:
+    plz_index = None
+    for idx, t in enumerate(teile):
         m = re.search(r"\b(\d{5})\s+(.+)", t)
         if m:
             ort = re.split(r"[-]| Zentrum| Innenstadt| Stadtgebiet| Süd| Nord| Ost| West",
                            m.group(2))[0].strip()
             plz_ort = f"{m.group(1)} {ort}"
+            plz_index = idx
             break
-    varianten = []
-    if strasse and plz_ort:
-        varianten.append(f"{strasse}, {plz_ort}")
-    if plz_ort:
-        varianten.append(plz_ort)
-    if not varianten:
-        varianten.append(s)
-    return varianten
+
+    pluscode = None
+    pluscode_index = None
+    for idx, t in enumerate(teile):
+        for token in PLUSCODE_REGEX.findall(t):
+            if olc.isValid(token):
+                pluscode = token.upper()
+                pluscode_index = idx
+                break
+        if pluscode:
+            break
+
+    strasse = None
+    for idx, t in enumerate(teile):
+        if idx == plz_index or idx == pluscode_index:
+            continue
+        if re.search(r"\boder\b", t, re.I):
+            # eher eine unsichere Ortsbeschreibung ("Kemter Wiesen oder Mainzer
+            # Str. 199") als eine echte Adresse - nicht als Strasse verwenden.
+            continue
+        strasse = t
+        break
+
+    return strasse, pluscode, plz_ort
+
+
+def photon_suche(query):
+    headers = {"User-Agent": "spielfeld-abstandsmatrix/1.0"}
+    r = requests.get("https://photon.komoot.io/api/",
+                     params={"q": query, "limit": 1, "lang": "de"},
+                     headers=headers, timeout=30)
+    r.raise_for_status()
+    feats = r.json().get("features", [])
+    time.sleep(1.0)
+    if feats:
+        lon, lat = feats[0]["geometry"]["coordinates"]
+        return (float(lat), float(lon))
+    return None
 
 
 def geocode(adresse, cache):
+    # quelle gibt an, wie praezise die Koordinate ist: "pluscode"/"strasse"
+    # sind genau, "ortsmitte" (nur PLZ/Ort) und "rohtext" sind Fallbacks.
     if adresse in cache:
         return cache[adresse]
-    headers = {"User-Agent": "spielfeld-abstandsmatrix/1.0"}
+    strasse, pluscode, plz_ort = parse_adresse(adresse)
     result = None
-    for variante in clean_address(adresse):
-        r = requests.get("https://photon.komoot.io/api/",
-                         params={"q": variante, "limit": 1, "lang": "de"},
-                         headers=headers, timeout=30)
-        r.raise_for_status()
-        feats = r.json().get("features", [])
-        time.sleep(1.0)
-        if feats:
-            lon, lat = feats[0]["geometry"]["coordinates"]
-            result = (float(lat), float(lon))
-            break
-    cache[adresse] = result
-    return result
+    quelle = None
+
+    if pluscode and plz_ort:
+        referenz = photon_suche(plz_ort)
+        if referenz:
+            try:
+                voller_code = olc.recoverNearest(pluscode, referenz[0], referenz[1])
+                bereich = olc.decode(voller_code)
+                result = (bereich.latitudeCenter, bereich.longitudeCenter)
+                quelle = "pluscode"
+            except Exception:
+                result = None
+
+    if result is None:
+        varianten = []
+        if strasse and plz_ort:
+            varianten.append(("strasse", f"{strasse}, {plz_ort}"))
+        if plz_ort:
+            varianten.append(("ortsmitte", plz_ort))
+        if not varianten:
+            varianten.append(("rohtext", adresse))
+        for label, variante in varianten:
+            result = photon_suche(variante)
+            if result:
+                quelle = label
+                break
+
+    cache[adresse] = (result, quelle)
+    return cache[adresse]
+
+
+def baue_geocoding_log(labels, namen, adressen, quellen, valid):
+    ortsmitte = [(labels[i], namen[i], adressen[i]) for i in range(len(labels))
+                 if quellen[i] in ("ortsmitte", "rohtext")]
+    fehlend = [(labels[i], namen[i], adressen[i]) for i in range(len(labels)) if not valid[i]]
+
+    zeilen = []
+    if ortsmitte:
+        zeilen.append("Nur ueber Ortsmitte/PLZ aufgeloest (ungenau, keine Strasse oder Pluscode gefunden):")
+        for vnr, name, adr in ortsmitte:
+            zeilen.append(f"  {vnr} ({name}): {adr}")
+        zeilen.append("")
+    if fehlend:
+        zeilen.append("Keine Koordinate gefunden:")
+        for vnr, name, adr in fehlend:
+            zeilen.append(f"  {vnr} ({name}): {adr or '(keine Adresse)'}")
+        zeilen.append("")
+    if not zeilen:
+        zeilen.append("Alle Adressen wurden ueber Strasse oder Pluscode praezise aufgeloest.")
+    return "\n".join(zeilen)
 
 
 def dist(matrix, i, j):
@@ -111,6 +187,16 @@ def kanonisch(gruppen):
     # Reihenfolge innerhalb einer Gruppe ist irrelevant fuer die Kosten -
     # feste Sortierung verhindert, dass reines Umsortieren als Aenderung gilt.
     return [sorted(grp) for grp in gruppen]
+
+
+GRUPPEN_RGB = [
+    [37, 99, 235], [22, 163, 74], [147, 51, 234], [234, 88, 12],
+    [8, 145, 178], [202, 138, 4], [219, 39, 119], [77, 124, 15],
+]
+
+
+def gruppen_rgb(gi):
+    return GRUPPEN_RGB[gi % len(GRUPPEN_RGB)]
 
 
 def baue_ausgabe_excel(labels, namen, matrix, gruppen):
@@ -211,15 +297,18 @@ if start:
     # ------------------------------------------------------------------
     cache = {}
     coords = []
+    quellen = []
     nicht_gefunden = []
     progress = st.progress(0.0, text="Geocoding...")
     for idx, (vnr, _, adr) in enumerate(vereine):
         if not adr:
             coords.append(None)
+            quellen.append(None)
             nicht_gefunden.append((vnr, "(keine Adresse)"))
         else:
-            c = geocode(adr, cache)
+            c, q = geocode(adr, cache)
             coords.append(c)
+            quellen.append(q)
             if c is None:
                 nicht_gefunden.append((vnr, adr))
         progress.progress((idx + 1) / N, text=f"Geocoding {idx + 1}/{N}: {vnr}")
@@ -307,7 +396,8 @@ if start:
         alle_kosten_n=len(alle_kosten), mittlere_kosten=mittlere_kosten,
         groesste_kosten=groesste_kosten, zufalls_kosten_n=len(zufalls_kosten),
         mittel_zufall=mittel_zufall, verbesserung=verbesserung,
-        dateiname=datei.name,
+        dateiname=datei.name, coords=coords, quellen=quellen,
+        adressen=[adr for _, _, adr in vereine],
     )
     st.session_state.aktuelle_gruppen = kanonisch(beste)
     st.session_state.vorherige_gruppen = kanonisch(beste)
@@ -327,6 +417,10 @@ M = erg["M"]
 n_gruppen = erg["n_gruppen"]
 beste = erg["beste"]
 beste_kosten = erg["beste_kosten"]
+coords = erg["coords"]
+quellen = erg["quellen"]
+adressen = erg["adressen"]
+datei_basis, datei_ext = os.path.splitext(erg["dateiname"])
 
 # ----------------------------------------------------------------------
 # Referenzwerte (Optimum, Zufallsneustarts, reiner Zufall)
@@ -348,6 +442,19 @@ st.caption(
 ohne = [f"{labels[i]} ({namen[i]})" for i in range(N) if not valid[i]]
 if ohne:
     st.warning("Nicht zugeordnet (keine Koordinate): " + ", ".join(ohne))
+
+ungenau_n = sum(1 for q in quellen if q in ("ortsmitte", "rohtext"))
+if ungenau_n:
+    st.warning(
+        f"{ungenau_n} Adresse(n) konnten nicht praezise aufgeloest werden und wurden nur "
+        "ueber die Ortsmitte (PLZ/Ort) geocodiert. Details siehe Geocoding-Log."
+    )
+st.download_button(
+    "Geocoding-Log herunterladen",
+    data=baue_geocoding_log(labels, namen, adressen, quellen, valid).encode("utf-8"),
+    file_name=f"{datei_basis}-Geocoding-Log.txt",
+    mime="text/plain",
+)
 
 # ----------------------------------------------------------------------
 # Gruppen interaktiv anpassen (Drag & Drop)
@@ -437,10 +544,82 @@ for gi in range(n_gruppen):
                   delta=f"{delta_vor_gi:+.1f} km", delta_color="inverse")
 
 # ----------------------------------------------------------------------
+# Karte
+# ----------------------------------------------------------------------
+if "zeige_karte" not in st.session_state:
+    st.session_state.zeige_karte = False
+karte_label = "Karte ausblenden" if st.session_state.zeige_karte else "Gruppen auf Karte anzeigen"
+if st.button(karte_label, key="karte_toggle"):
+    st.session_state.zeige_karte = not st.session_state.zeige_karte
+    st.rerun()
+
+if st.session_state.zeige_karte:
+    aktuelle_gruppe_von = {}
+    for gi, grp in enumerate(aktuelle):
+        for idx in grp:
+            aktuelle_gruppe_von[idx] = gi
+
+    punkte = []
+    for idx, gi in aktuelle_gruppe_von.items():
+        if coords[idx] is None:
+            continue
+        lat, lon = coords[idx]
+        punkte.append({
+            "lat": lat, "lon": lon,
+            "farbe": gruppen_rgb(gi),
+            "label": f"{labels[idx]} ({namen[idx]})",
+            "gruppe": gi + 1,
+        })
+
+    # Mehrere Vereine koennen exakt denselben geocodierten Punkt haben
+    # (z.B. gleiche Ortsmitte als Fallback) - leicht auffaechern, damit
+    # sich die Marker nicht gegenseitig verdecken.
+    orte = {}
+    for p in punkte:
+        orte.setdefault((p["lat"], p["lon"]), []).append(p)
+    for gruppe_am_ort in orte.values():
+        n = len(gruppe_am_ort)
+        if n > 1:
+            radius_grad = 0.0015
+            for k, p in enumerate(gruppe_am_ort):
+                winkel = 2 * math.pi * k / n
+                p["lat"] += radius_grad * math.sin(winkel)
+                p["lon"] += radius_grad * math.cos(winkel) / math.cos(math.radians(p["lat"]))
+
+    if punkte:
+        st.caption(" · ".join(
+            f'<span style="color:rgb({gruppen_rgb(gi)[0]},{gruppen_rgb(gi)[1]},{gruppen_rgb(gi)[2]})">⬤</span> '
+            f"Gruppe {gi + 1} (aktuell)"
+            for gi in range(n_gruppen)
+        ), unsafe_allow_html=True)
+
+        schicht = pdk.Layer(
+            "ScatterplotLayer",
+            data=punkte,
+            get_position="[lon, lat]",
+            get_fill_color="farbe",
+            get_radius=400,
+            radius_min_pixels=6,
+            radius_max_pixels=20,
+            stroked=True,
+            get_line_color=[255, 255, 255],
+            line_width_min_pixels=1,
+            pickable=True,
+        )
+        ansicht = pdk.data_utils.compute_view([[p["lon"], p["lat"]] for p in punkte])
+        ansicht.zoom = max(0, ansicht.zoom - 0.6)  # Sicherheitsabstand, damit Randpunkte nicht abgeschnitten werden
+        st.pydeck_chart(pdk.Deck(
+            layers=[schicht],
+            initial_view_state=ansicht,
+            tooltip={"html": "<b>{label}</b><br/>Gruppe {gruppe}"},
+        ), height=600)
+    else:
+        st.info("Keine Koordinaten zum Anzeigen vorhanden.")
+
+# ----------------------------------------------------------------------
 # Download
 # ----------------------------------------------------------------------
 excel_bytes = baue_ausgabe_excel(labels, namen, matrix, aktuelle)
-datei_basis, datei_ext = os.path.splitext(erg["dateiname"])
 ausgabe_dateiname = f"{datei_basis}-Gruppeneinteilung{datei_ext or '.xlsx'}"
 st.download_button(
     f"{ausgabe_dateiname} herunterladen",

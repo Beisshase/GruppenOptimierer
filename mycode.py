@@ -4,6 +4,7 @@ import time
 import random
 import openpyxl
 import requests
+from openlocationcode import openlocationcode as olc
 
 EXCEL_IN  = "Meldelisten-mit-Sportstätten_A1.xlsx"
 _basis, _ext = os.path.splitext(EXCEL_IN)
@@ -36,57 +37,107 @@ namen = [name for _, name, _ in vereine]
 N = len(vereine)
 
 # ----------------------------------------------------------------------
-# 2) Adresse bereinigen
+# 2) Adresse bereinigen: Adresse besteht aus "Straße, PLZ Ort" oder
+#    "Pluscode, PLZ Ort"
 # ----------------------------------------------------------------------
-def clean_address(adresse):
+PLUSCODE_REGEX = re.compile(r"\b[23456789CFGHJMPQRVWXcfghjmpqrvwx]{2,8}\+[23456789CFGHJMPQRVWXcfghjmpqrvwx]{0,3}\b")
+
+def parse_adresse(adresse):
+    # Adresse ist bereinigt auf "Strasse/Platzname, PLZ Ort" bzw. "Pluscode,
+    # PLZ Ort" - die Strasse muss daher kein bestimmtes Wort (Weg/Strasse/...)
+    # enthalten, sie ist einfach das Segment, das weder PLZ/Ort noch Pluscode ist.
     s = adresse.replace("  ", " ").strip()
-    teile = [t.strip() for t in s.split(",")]
-    strasse = None
-    for t in teile:
-        if re.search(r"(str\.?|straße|strasse|weg|gasse|ring|allee|wiese)", t, re.I) \
-           and not re.search(r"rasenplatz|kunstrasen|hartplatz|stadion", t, re.I):
-            strasse = t
-            break
+    teile = [t.strip() for t in s.split(",") if t.strip()]
+
     plz_ort = None
-    for t in teile:
+    plz_index = None
+    for idx, t in enumerate(teile):
         m = re.search(r"\b(\d{5})\s+(.+)", t)
         if m:
             ort = re.split(r"[-]| Zentrum| Innenstadt| Stadtgebiet| Süd| Nord| Ost| West",
                            m.group(2))[0].strip()
             plz_ort = f"{m.group(1)} {ort}"
+            plz_index = idx
             break
-    varianten = []
-    if strasse and plz_ort:
-        varianten.append(f"{strasse}, {plz_ort}")
-    if plz_ort:
-        varianten.append(plz_ort)
-    if not varianten:
-        varianten.append(s)
-    return varianten
+
+    pluscode = None
+    pluscode_index = None
+    for idx, t in enumerate(teile):
+        for token in PLUSCODE_REGEX.findall(t):
+            if olc.isValid(token):
+                pluscode = token.upper()
+                pluscode_index = idx
+                break
+        if pluscode:
+            break
+
+    strasse = None
+    for idx, t in enumerate(teile):
+        if idx == plz_index or idx == pluscode_index:
+            continue
+        if re.search(r"\boder\b", t, re.I):
+            # eher eine unsichere Ortsbeschreibung ("Kemter Wiesen oder Mainzer
+            # Str. 199") als eine echte Adresse - nicht als Strasse verwenden.
+            continue
+        strasse = t
+        break
+
+    return strasse, pluscode, plz_ort
 
 # ----------------------------------------------------------------------
-# 3) Geocoding (Photon)
+# 3) Geocoding (Photon, mit Pluscode-Unterstuetzung)
 # ----------------------------------------------------------------------
+def photon_suche(query):
+    headers = {"User-Agent": "spielfeld-abstandsmatrix/1.0"}
+    r = requests.get("https://photon.komoot.io/api/",
+                     params={"q": query, "limit": 1, "lang": "de"},
+                     headers=headers, timeout=30)
+    r.raise_for_status()
+    feats = r.json().get("features", [])
+    time.sleep(1.0)
+    if feats:
+        lon, lat = feats[0]["geometry"]["coordinates"]
+        return (float(lat), float(lon))
+    return None
+
 def geocode(adresse, cache={}):
+    # quelle gibt an, wie praezise die Koordinate ist: "pluscode"/"strasse"
+    # sind genau, "ortsmitte" (nur PLZ/Ort) und "rohtext" sind Fallbacks.
     if adresse in cache:
         return cache[adresse]
-    headers = {"User-Agent": "spielfeld-abstandsmatrix/1.0"}
+    strasse, pluscode, plz_ort = parse_adresse(adresse)
     result = None
-    for variante in clean_address(adresse):
-        r = requests.get("https://photon.komoot.io/api/",
-                         params={"q": variante, "limit": 1, "lang": "de"},
-                         headers=headers, timeout=30)
-        r.raise_for_status()
-        feats = r.json().get("features", [])
-        time.sleep(1.0)
-        if feats:
-            lon, lat = feats[0]["geometry"]["coordinates"]
-            result = (float(lat), float(lon))
-            break
-    cache[adresse] = result
-    return result
+    quelle = None
+
+    if pluscode and plz_ort:
+        referenz = photon_suche(plz_ort)
+        if referenz:
+            try:
+                voller_code = olc.recoverNearest(pluscode, referenz[0], referenz[1])
+                bereich = olc.decode(voller_code)
+                result = (bereich.latitudeCenter, bereich.longitudeCenter)
+                quelle = "pluscode"
+            except Exception:
+                result = None
+
+    if result is None:
+        varianten = []
+        if strasse and plz_ort:
+            varianten.append(("strasse", f"{strasse}, {plz_ort}"))
+        if plz_ort:
+            varianten.append(("ortsmitte", plz_ort))
+        if not varianten:
+            varianten.append(("rohtext", adresse))
+        for label, variante in varianten:
+            result = photon_suche(variante)
+            if result:
+                quelle = label
+                break
+    cache[adresse] = (result, quelle)
+    return cache[adresse]
 
 nicht_gefunden = []
+ungenau = []
 
 if os.path.exists(EXCEL_OUT):
     print(f"\n{EXCEL_OUT} existiert bereits -> Matrix wird daraus geladen (kein erneutes Geocoding/OSRM).")
@@ -112,13 +163,15 @@ else:
             nicht_gefunden.append((vnr, "(keine Adresse)"))
             print(f"{vnr}: KEINE Adresse")
             continue
-        c = geocode(adr)
+        c, q = geocode(adr)
         coords.append(c)
         if c is None:
             nicht_gefunden.append((vnr, adr))
             print(f"{vnr}: NICHT gefunden -> {adr}")
         else:
-            print(f"{vnr}: {c[0]:.5f}, {c[1]:.5f}")
+            if q in ("ortsmitte", "rohtext"):
+                ungenau.append((vnr, adr))
+            print(f"{vnr}: {c[0]:.5f}, {c[1]:.5f}" + ("  [nur Ortsmitte/PLZ]" if q in ("ortsmitte", "rohtext") else ""))
 
     # ------------------------------------------------------------------
     # 4) Fahrtkilometer-Matrix (OSRM)
@@ -282,4 +335,8 @@ print(f"\nGespeichert: {EXCEL_OUT} (Matrix + Gruppen)")
 if nicht_gefunden:
     print("\nNicht geocodiert:")
     for vnr, adr in nicht_gefunden:
+        print(f"  {vnr}: {adr}")
+if ungenau:
+    print("\nNur ueber Ortsmitte/PLZ aufgeloest (ungenau, keine Strasse oder Pluscode gefunden):")
+    for vnr, adr in ungenau:
         print(f"  {vnr}: {adr}")
