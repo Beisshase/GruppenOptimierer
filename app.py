@@ -5,6 +5,7 @@ import random
 import re
 import time
 
+import numpy as np
 import openpyxl
 import pydeck as pdk
 import requests
@@ -12,8 +13,11 @@ import streamlit as st
 from openlocationcode import openlocationcode as olc
 from streamlit_sortables import sort_items
 
+VERSION = "1.01"
+OSRM_BATCH = 50   # max Koordinaten pro OSRM-Anfrage; Inter-Chunk-Requests haben 2x davon
+
 st.set_page_config(page_title="GruppenOptimierer", layout="wide")
-st.title("GruppenOptimierer")
+st.title(f"GruppenOptimierer v{VERSION}")
 st.write(
     "Lädt eine Excel-Datei mit Vereinsadressen, berechnet die Fahrtkilometer-Matrix "
     "zwischen den Spielfeldern und teilt die Vereine in ausgewogene Gruppen mit "
@@ -121,6 +125,54 @@ def geocode(adresse, cache):
 
     cache[adresse] = (result, quelle)
     return cache[adresse]
+
+
+def osrm_matrix_chunked(gueltige_coords, on_block=None):
+    """Berechnet MxM-Distanzmatrix in Batches (umgeht URL-Laengenlimit bei >OSRM_BATCH Coords)."""
+    M = len(gueltige_coords)
+    if M <= OSRM_BATCH:
+        coord_str = ";".join(f"{lon:.6f},{lat:.6f}" for lat, lon in gueltige_coords)
+        r = requests.get(f"https://router.project-osrm.org/table/v1/driving/{coord_str}",
+                         params={"annotations": "distance"}, timeout=120)
+        r.raise_for_status()
+        osrm = r.json()["distances"]
+        if on_block:
+            on_block(1, 1)
+        return [[round(osrm[a][b] / 1000, 1) if osrm[a][b] is not None else None
+                 for b in range(M)] for a in range(M)]
+
+    raw = [[None] * M for _ in range(M)]
+    chunks = [list(range(s, min(s + OSRM_BATCH, M))) for s in range(0, M, OSRM_BATCH)]
+    n_chunks = len(chunks)
+    n_tasks = n_chunks * (n_chunks + 1) // 2
+    fertig = 0
+    for ci, ca in enumerate(chunks):
+        for cj in range(ci, n_chunks):
+            cb = chunks[cj]
+            combined = ca if ci == cj else ca + cb
+            n_a = len(ca)
+            coord_str = ";".join(f"{gueltige_coords[k][1]:.6f},{gueltige_coords[k][0]:.6f}"
+                                 for k in combined)
+            r = requests.get(f"https://router.project-osrm.org/table/v1/driving/{coord_str}",
+                             params={"annotations": "distance"}, timeout=120)
+            r.raise_for_status()
+            osrm = r.json()["distances"]
+            if ci == cj:
+                for a, i in enumerate(ca):
+                    for b, j in enumerate(ca):
+                        d = osrm[a][b]
+                        raw[i][j] = round(d / 1000, 1) if d is not None else None
+            else:
+                for a, i in enumerate(ca):
+                    for b, j in enumerate(cb):
+                        d_ab = osrm[a][n_a + b]
+                        d_ba = osrm[n_a + b][a]
+                        raw[i][j] = round(d_ab / 1000, 1) if d_ab is not None else None
+                        raw[j][i] = round(d_ba / 1000, 1) if d_ba is not None else None
+            fertig += 1
+            if on_block:
+                on_block(fertig, n_tasks)
+    return raw
 
 
 def baue_geocoding_log(labels, namen, adressen, quellen, valid):
@@ -250,7 +302,7 @@ with st.sidebar:
     st.header("Eingabe")
     datei = st.file_uploader("Meldelisten-Excel (.xlsx)", type=["xlsx"])
     sheet = st.text_input("Worksheet-Name (leer = erstes Worksheet)", value="")
-    n_gruppen_input = st.number_input("Anzahl Gruppen", min_value=2, max_value=20, value=4, step=1)
+    n_gruppen_input = st.number_input("Anzahl Gruppen", min_value=2, max_value=100, value=4, step=1)
     with st.expander("Erweiterte Einstellungen"):
         seed = st.number_input("Zufallssaat", value=42, step=1)
         versuche = st.number_input("Zufallsneustarts (Heuristik)", min_value=1, max_value=200, value=40, step=1)
@@ -323,21 +375,21 @@ if start:
         st.stop()
 
     # ------------------------------------------------------------------
-    # 4) Fahrtkilometer-Matrix (OSRM)
+    # 4) Fahrtkilometer-Matrix (OSRM, in Batches fuer grosse Vereinsmengen)
     # ------------------------------------------------------------------
-    with st.spinner("Berechne Fahrtkilometer-Matrix (OSRM)..."):
-        gueltige_coords = [coords[i] for i in gueltig]
-        coord_str = ";".join(f"{lon},{lat}" for lat, lon in gueltige_coords)
-        r = requests.get(f"https://router.project-osrm.org/table/v1/driving/{coord_str}",
-                         params={"annotations": "distance"}, timeout=120)
-        r.raise_for_status()
-        osrm = r.json()["distances"]
+    gueltige_coords = [coords[i] for i in gueltig]
+    progress_osrm = st.progress(0.0, text=f"Berechne Fahrtkilometer-Matrix (OSRM, {M} Vereine)...")
+    raw = osrm_matrix_chunked(
+        gueltige_coords,
+        on_block=lambda f, g: progress_osrm.progress(f / g,
+                                                      text=f"OSRM-Matrix: Block {f}/{g}"),
+    )
+    progress_osrm.empty()
 
     matrix = [[None] * N for _ in range(N)]
     for a, i in enumerate(gueltig):
         for b, j in enumerate(gueltig):
-            d = osrm[a][b]
-            matrix[i][j] = round(d / 1000, 1) if d is not None else None
+            matrix[i][j] = raw[a][b]
 
     # ------------------------------------------------------------------
     # 5) In n_gruppen ausgewogene Gruppen aufteilen (minimale interne Distanz)
@@ -345,6 +397,18 @@ if start:
     random.seed(int(seed))
     basis, rest = M // n_gruppen, M % n_gruppen
     groessen = [basis + (1 if g < rest else 0) for g in range(n_gruppen)]
+
+    # Symmetrische Distanzmatrix fuer vektorisierte Optimierung
+    sym = np.zeros((N, N))
+    for _i in range(N):
+        for _j in range(N):
+            _a, _b = matrix[_i][_j], matrix[_j][_i]
+            if _a is not None and _b is not None:
+                sym[_i, _j] = (_a + _b) / 2.0
+            elif _a is not None:
+                sym[_i, _j] = float(_a)
+            elif _b is not None:
+                sym[_i, _j] = float(_b)
 
     def startloesung():
         pool = gueltig[:]
@@ -356,20 +420,24 @@ if start:
         return gr
 
     def optimiere(gr):
+        # Vektorisierte Delta-Formel: delta[ia,ib] = sA[b]-sA[a] + sB[a]-sB[b] - 2*sym[a,b]
         verbessert = True
         while verbessert:
             verbessert = False
             for ga in range(n_gruppen):
                 for gb in range(ga + 1, n_gruppen):
-                    for ia in range(len(gr[ga])):
-                        for ib in range(len(gr[gb])):
-                            vor = gruppen_kosten(matrix, gr[ga]) + gruppen_kosten(matrix, gr[gb])
-                            gr[ga][ia], gr[gb][ib] = gr[gb][ib], gr[ga][ia]
-                            nach = gruppen_kosten(matrix, gr[ga]) + gruppen_kosten(matrix, gr[gb])
-                            if nach < vor - 1e-9:
-                                verbessert = True
-                            else:
-                                gr[ga][ia], gr[gb][ib] = gr[gb][ib], gr[ga][ia]
+                    A = np.array(gr[ga])
+                    B = np.array(gr[gb])
+                    sA = sym[:, A].sum(axis=1)
+                    sB = sym[:, B].sum(axis=1)
+                    delta = (sA[B][np.newaxis, :] - sA[A][:, np.newaxis]
+                           + sB[A][:, np.newaxis] - sB[B][np.newaxis, :]
+                           - 2.0 * sym[np.ix_(A, B)])
+                    best = int(delta.argmin())
+                    best_ia, best_ib = divmod(best, len(B))
+                    if delta.flat[best] < -1e-9:
+                        gr[ga][best_ia], gr[gb][best_ib] = int(B[best_ib]), int(A[best_ia])
+                        verbessert = True
         return gr
 
     with st.spinner(f"Optimiere Gruppen ({int(versuche)} Zufallsneustarts)..."):

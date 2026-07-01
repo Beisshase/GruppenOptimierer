@@ -2,16 +2,19 @@ import os
 import re
 import time
 import random
+import numpy as np
 import openpyxl
 import requests
 from openlocationcode import openlocationcode as olc
 
-EXCEL_IN  = "Meldelisten-mit-Sportstätten_A1.xlsx"
+EXCEL_IN   = "Meldelisten-mit-Sportstätten_A1.xlsx"
 _basis, _ext = os.path.splitext(EXCEL_IN)
-EXCEL_OUT = f"{_basis}-Gruppeneinteilung{_ext}"
-SHEET     = "AZ"
-N_GRUPPEN = 4          # <- hier später variieren
-SEED      = 42
+EXCEL_OUT  = f"{_basis}-Gruppeneinteilung{_ext}"
+SHEET      = "AZ"
+N_GRUPPEN  = 4          # <- hier später variieren
+SEED       = 42
+VERSUCHE   = 40         # Zufallsneustarts fuer die Heuristik
+OSRM_BATCH = 50         # max Koordinaten pro OSRM-Anfrage; Inter-Chunk-Requests haben 2x davon
 
 # ----------------------------------------------------------------------
 # 1) Excel einlesen: Spalte A = V.Nr., Spalte B = Vereinsname, Spalte L = Adresse
@@ -136,6 +139,61 @@ def geocode(adresse, cache={}):
     cache[adresse] = (result, quelle)
     return cache[adresse]
 
+
+def osrm_matrix_chunked(gueltige_coords, on_block=None):
+    """Berechnet MxM-Distanzmatrix in Batches (umgeht URL-Laengenlimit bei >OSRM_BATCH Coords)."""
+    M = len(gueltige_coords)
+    if M <= OSRM_BATCH:
+        coord_str = ";".join(f"{lon:.6f},{lat:.6f}" for lat, lon in gueltige_coords)
+        r = requests.get(f"https://router.project-osrm.org/table/v1/driving/{coord_str}",
+                         params={"annotations": "distance"}, timeout=120)
+        r.raise_for_status()
+        osrm = r.json()["distances"]
+        if on_block:
+            on_block(1, 1)
+        else:
+            print()
+        return [[round(osrm[a][b] / 1000, 1) if osrm[a][b] is not None else None
+                 for b in range(M)] for a in range(M)]
+
+    raw = [[None] * M for _ in range(M)]
+    chunks = [list(range(s, min(s + OSRM_BATCH, M))) for s in range(0, M, OSRM_BATCH)]
+    n_chunks = len(chunks)
+    n_tasks = n_chunks * (n_chunks + 1) // 2
+    fertig = 0
+    for ci, ca in enumerate(chunks):
+        for cj in range(ci, n_chunks):
+            cb = chunks[cj]
+            combined = ca if ci == cj else ca + cb
+            n_a = len(ca)
+            coord_str = ";".join(f"{gueltige_coords[k][1]:.6f},{gueltige_coords[k][0]:.6f}"
+                                 for k in combined)
+            r = requests.get(f"https://router.project-osrm.org/table/v1/driving/{coord_str}",
+                             params={"annotations": "distance"}, timeout=120)
+            r.raise_for_status()
+            osrm = r.json()["distances"]
+            if ci == cj:
+                for a, i in enumerate(ca):
+                    for b, j in enumerate(ca):
+                        d = osrm[a][b]
+                        raw[i][j] = round(d / 1000, 1) if d is not None else None
+            else:
+                for a, i in enumerate(ca):
+                    for b, j in enumerate(cb):
+                        d_ab = osrm[a][n_a + b]
+                        d_ba = osrm[n_a + b][a]
+                        raw[i][j] = round(d_ab / 1000, 1) if d_ab is not None else None
+                        raw[j][i] = round(d_ba / 1000, 1) if d_ba is not None else None
+            fertig += 1
+            if on_block:
+                on_block(fertig, n_tasks)
+            else:
+                print(f"  OSRM-Matrix: Block {fertig}/{n_tasks} ", end="\r", flush=True)
+    if not on_block:
+        print()
+    return raw
+
+
 nicht_gefunden = []
 ungenau = []
 
@@ -179,19 +237,26 @@ else:
     gueltig_idx = [i for i, c in enumerate(coords) if c is not None]
     gueltige_coords = [coords[i] for i in gueltig_idx]
 
-    coord_str = ";".join(f"{lon},{lat}" for lat, lon in gueltige_coords)
-    r = requests.get(f"https://router.project-osrm.org/table/v1/driving/{coord_str}",
-                     params={"annotations": "distance"}, timeout=120)
-    r.raise_for_status()
-    osrm = r.json()["distances"]
-
+    print(f"Berechne Fahrtkilometer-Matrix (OSRM, {len(gueltige_coords)} Vereine)...")
+    raw = osrm_matrix_chunked(gueltige_coords)
     matrix = [[None] * N for _ in range(N)]
     for a, i in enumerate(gueltig_idx):
         for b, j in enumerate(gueltig_idx):
-            d = osrm[a][b]
-            matrix[i][j] = round(d / 1000, 1) if d is not None else None
+            matrix[i][j] = raw[a][b]
 
     valid = [c is not None for c in coords]
+
+# Symmetrische Distanzmatrix fuer vektorisierte Optimierung (Ø beider Richtungen)
+sym = np.zeros((N, N))
+for _i in range(N):
+    for _j in range(N):
+        _a, _b = matrix[_i][_j], matrix[_j][_i]
+        if _a is not None and _b is not None:
+            sym[_i, _j] = (_a + _b) / 2.0
+        elif _a is not None:
+            sym[_i, _j] = float(_a)
+        elif _b is not None:
+            sym[_i, _j] = float(_b)
 
 # ----------------------------------------------------------------------
 # 5) Matrix in Excel (Blatt 1)
@@ -243,25 +308,31 @@ def startloesung():
     return gr
 
 def optimiere(gr):
+    # Pro Gruppenpaar wird der beste Tausch vektorisiert berechnet (numpy-Delta-Formel).
+    # Kostendelta fuer Tausch a<->b: sA[b]-sA[a] + sB[a]-sB[b] - 2*sym[a,b]
+    # wobei sA[x] = sum(sym[x, m] for m in Gruppe_A), analog sB.
     verbessert = True
     while verbessert:
         verbessert = False
         for ga in range(N_GRUPPEN):
             for gb in range(ga + 1, N_GRUPPEN):
-                for ia in range(len(gr[ga])):
-                    for ib in range(len(gr[gb])):
-                        vor = gruppen_kosten(gr[ga]) + gruppen_kosten(gr[gb])
-                        gr[ga][ia], gr[gb][ib] = gr[gb][ib], gr[ga][ia]
-                        nach = gruppen_kosten(gr[ga]) + gruppen_kosten(gr[gb])
-                        if nach < vor - 1e-9:
-                            verbessert = True
-                        else:
-                            gr[ga][ia], gr[gb][ib] = gr[gb][ib], gr[ga][ia]
+                A = np.array(gr[ga])
+                B = np.array(gr[gb])
+                sA = sym[:, A].sum(axis=1)   # sA[x] = Σ sym[x, a] fuer a in A
+                sB = sym[:, B].sum(axis=1)   # sB[x] = Σ sym[x, b] fuer b in B
+                delta = (sA[B][np.newaxis, :] - sA[A][:, np.newaxis]
+                       + sB[A][:, np.newaxis] - sB[B][np.newaxis, :]
+                       - 2.0 * sym[np.ix_(A, B)])
+                best = int(delta.argmin())
+                best_ia, best_ib = divmod(best, len(B))
+                if delta.flat[best] < -1e-9:
+                    gr[ga][best_ia], gr[gb][best_ib] = int(B[best_ib]), int(A[best_ia])
+                    verbessert = True
     return gr
 
 beste, beste_kosten = None, float("inf")
 alle_kosten = []
-for _ in range(40):
+for _ in range(VERSUCHE):
     g = optimiere(startloesung())
     k = gesamt_kosten(g)
     alle_kosten.append(k)
