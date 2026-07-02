@@ -76,6 +76,19 @@ Kommandozeile:
 Website (lokal):
   py -3.12 -m streamlit run app.py
 
+Versionshistorie
+----------------
+v1.02 (2026-07-02)
+  - Nebenbedingung: Vereine mit gleicher Vereinsnummer werden automatisch
+    auf verschiedene Gruppen verteilt; manuelles Verletzen zeigt Warnung
+  - Geocoding-Log nennt Photon von Komoot als Quelle
+
+v1.01 (2026-07-02)
+  - Skalierung auf bis zu 600 Vereine: OSRM-Matrix in Batches (max.
+    50 Koordinaten pro Anfrage), Optimierung mit numpy vektorisiert
+  - Anzahl Gruppen im UI bis 100 erhoeht
+  - Versionsnummer im Titel der Website
+
 Copyright
 ---------
 (c) 2026 by Kynso GmbH

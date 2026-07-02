@@ -4,6 +4,7 @@ import os
 import random
 import re
 import time
+from collections import Counter
 
 import numpy as np
 import openpyxl
@@ -13,7 +14,7 @@ import streamlit as st
 from openlocationcode import openlocationcode as olc
 from streamlit_sortables import sort_items
 
-VERSION = "1.01"
+VERSION = "1.02"
 OSRM_BATCH = 50   # max Koordinaten pro OSRM-Anfrage; Inter-Chunk-Requests haben 2x davon
 
 st.set_page_config(page_title="GruppenOptimierer", layout="wide")
@@ -193,6 +194,8 @@ def baue_geocoding_log(labels, namen, adressen, quellen, valid):
         zeilen.append("")
     if not zeilen:
         zeilen.append("Alle Adressen wurden ueber Strasse oder Pluscode praezise aufgeloest.")
+    zeilen.append("")
+    zeilen.append("Geocoding-Dienst: Photon von Komoot – https://photon.komoot.io")
     return "\n".join(zeilen)
 
 
@@ -374,6 +377,21 @@ if start:
         st.error(f"Nur {M} Vereine konnten geocodiert werden, aber {n_gruppen} Gruppen angefordert.")
         st.stop()
 
+    # Nebenbedingung: Vereine mit gleicher Vereinsnummer in verschiedene Gruppen
+    _id_map = {}
+    for i in gueltig:
+        _id_map.setdefault(labels[i], []).append(i)
+    mehrfach = {vnr: idxs for vnr, idxs in _id_map.items() if len(idxs) > 1}
+    if mehrfach:
+        _max = max(len(v) for v in mehrfach.values())
+        if _max > n_gruppen:
+            st.error(
+                f"Eine Vereinsnummer erscheint {_max}× – die Nebenbedingung (gleiche "
+                f"Vereinsnummer in verschiedene Gruppen) kann mit nur {n_gruppen} Gruppen "
+                f"nicht erfüllt werden. Bitte Gruppenanzahl erhöhen."
+            )
+            st.stop()
+
     # ------------------------------------------------------------------
     # 4) Fahrtkilometer-Matrix (OSRM, in Batches fuer grosse Vereinsmengen)
     # ------------------------------------------------------------------
@@ -413,14 +431,30 @@ if start:
     def startloesung():
         pool = gueltig[:]
         random.shuffle(pool)
-        gr, pos = [], 0
-        for g in range(n_gruppen):
-            gr.append(pool[pos:pos + groessen[g]])
-            pos += groessen[g]
+        if not mehrfach:
+            gr, pos = [], 0
+            for g in range(n_gruppen):
+                gr.append(pool[pos:pos + groessen[g]])
+                pos += groessen[g]
+            return gr
+        # Nebenbedingung: gleiche Vereinsnummer nicht in derselben Gruppe
+        gr = [[] for _ in range(n_gruppen)]
+        kapaz = groessen[:]
+        gr_ids = [set() for _ in range(n_gruppen)]
+        for idx in pool:
+            lid = labels[idx]
+            frei = [g for g in range(n_gruppen) if kapaz[g] > 0 and lid not in gr_ids[g]]
+            if not frei:
+                frei = [g for g in range(n_gruppen) if kapaz[g] > 0]
+            g = random.choice(frei)
+            gr[g].append(idx)
+            kapaz[g] -= 1
+            gr_ids[g].add(lid)
         return gr
 
     def optimiere(gr):
         # Vektorisierte Delta-Formel: delta[ia,ib] = sA[b]-sA[a] + sB[a]-sB[b] - 2*sym[a,b]
+        # Infeasible Tausche (wuerden Nebenbedingung verletzen) erhalten delta=inf.
         verbessert = True
         while verbessert:
             verbessert = False
@@ -433,6 +467,19 @@ if start:
                     delta = (sA[B][np.newaxis, :] - sA[A][:, np.newaxis]
                            + sB[A][:, np.newaxis] - sB[B][np.newaxis, :]
                            - 2.0 * sym[np.ix_(A, B)])
+                    if mehrfach:
+                        lA = np.array([labels[int(k)] for k in A])
+                        lB = np.array([labels[int(k)] for k in B])
+                        cnt_ga = Counter(labels[int(k)] for k in gr[ga])
+                        cnt_gb = Counter(labels[int(k)] for k in gr[gb])
+                        cnt_B_in_ga = np.array([cnt_ga[lb] for lb in lB])
+                        cnt_A_in_gb = np.array([cnt_gb[la] for la in lA])
+                        same = (lA[:, np.newaxis] == lB[np.newaxis, :])
+                        # Nach Tausch: B[ib] geht in ga → verletzt NB wenn B-Label noch in ga
+                        eff_ga = cnt_B_in_ga[np.newaxis, :] - same.astype(int)
+                        # Nach Tausch: A[ia] geht in gb → verletzt NB wenn A-Label noch in gb
+                        eff_gb = cnt_A_in_gb[:, np.newaxis] - same.astype(int)
+                        delta[(eff_ga > 0) | (eff_gb > 0)] = np.inf
                     best = int(delta.argmin())
                     best_ia, best_ib = divmod(best, len(B))
                     if delta.flat[best] < -1e-9:
@@ -466,6 +513,7 @@ if start:
         mittel_zufall=mittel_zufall, verbesserung=verbesserung,
         dateiname=datei.name, coords=coords, quellen=quellen,
         adressen=[adr for _, _, adr in vereine],
+        mehrfach_ids=[(vnr, len(idxs)) for vnr, idxs in mehrfach.items()],
     )
     st.session_state.aktuelle_gruppen = kanonisch(beste)
     st.session_state.vorherige_gruppen = kanonisch(beste)
@@ -506,6 +554,14 @@ st.caption(
     f"{erg['mittel_zufall']:.1f} km [{erg['mittel_zufall'] / M:.1f} km/Verein] "
     f"-> Verbesserung durch Optimierung: {erg['verbesserung']:.0f} %"
 )
+
+mehrfach_ids = erg.get("mehrfach_ids", [])
+if mehrfach_ids:
+    details = ", ".join(f"{vnr} ({n}×)" for vnr, n in mehrfach_ids)
+    st.info(
+        f"Nebenbedingung aktiv: {len(mehrfach_ids)} Vereinsnummer(n) erscheinen mehrfach "
+        f"und wurden auf verschiedene Gruppen verteilt. ({details})"
+    )
 
 ohne = [f"{labels[i]} ({namen[i]})" for i in range(N) if not valid[i]]
 if ohne:
@@ -574,6 +630,20 @@ if neue_gruppen != aktuelle:
 
 aktuelle = st.session_state.aktuelle_gruppen
 vorherige = st.session_state.vorherige_gruppen
+
+# Nebenbedingung pruefen (nur Warnung, kein Blockieren)
+if mehrfach_ids:
+    nb_verletzungen = []
+    for gi, grp in enumerate(aktuelle):
+        seen = set()
+        for idx in grp:
+            vnr = labels[idx]
+            if vnr in seen:
+                nb_verletzungen.append((gi + 1, vnr))
+            seen.add(vnr)
+    if nb_verletzungen:
+        details = "; ".join(f"Gruppe {gi}: V.Nr. {vnr}" for gi, vnr in nb_verletzungen)
+        st.warning(f"Nebenbedingung verletzt: gleiche Vereinsnummer in einer Gruppe – {details}")
 
 aktuelle_kosten = gesamt_kosten(matrix, aktuelle)
 vorherige_kosten = gesamt_kosten(matrix, vorherige)
